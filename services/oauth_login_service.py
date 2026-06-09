@@ -195,26 +195,40 @@ class OAuthLoginService:
         """调用 /api/accounts/oauth/token 用 code+verifier 换 token 三件套。"""
         kwargs = proxy_settings.build_session_kwargs(impersonate="chrome", verify=False)
         session = requests.Session(**kwargs)
+        token_headers = {
+            **common_headers,
+            "referer": f"{platform_base}/",
+            "origin": platform_base,
+            "auth0-client": platform_auth0_client,
+            "sec-ch-ua": sec_ch_ua,
+            "user-agent": user_agent,
+        }
+        token_payload = {
+            "client_id": platform_oauth_client_id,
+            "code_verifier": code_verifier,
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": redirect_uri,
+        }
         try:
             response = session.post(
                 f"{auth_base}/api/accounts/oauth/token",
-                headers={
-                    **common_headers,
-                    "referer": f"{platform_base}/",
-                    "origin": platform_base,
-                    "auth0-client": platform_auth0_client,
-                    "sec-ch-ua": sec_ch_ua,
-                    "user-agent": user_agent,
-                },
-                json={
-                    "client_id": platform_oauth_client_id,
-                    "code_verifier": code_verifier,
-                    "grant_type": "authorization_code",
-                    "code": code,
-                    "redirect_uri": redirect_uri,
-                },
+                headers=token_headers,
+                json=token_payload,
                 timeout=60,
             )
+            # 命中 Cloudflare 盾页时，用 FlareSolverr 过盾后携带 cf_clearance 重试
+            from services import flaresolverr_service
+            if flaresolverr_service.is_cloudflare_challenge(response) and flaresolverr_service.is_enabled():
+                solved_ua = flaresolverr_service.solve_and_apply(session, f"{auth_base}/")
+                if solved_ua:
+                    token_headers["user-agent"] = solved_ua
+                    response = session.post(
+                        f"{auth_base}/api/accounts/oauth/token",
+                        headers=token_headers,
+                        json=token_payload,
+                        timeout=60,
+                    )
         except Exception as exc:
             raise OAuthLoginError(f"换 token 网络异常: {exc}") from exc
         finally:

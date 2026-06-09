@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 1.4.2 - 2026-06-09
+
++ [新增] 集成 FlareSolverr：注册/登录撞 Cloudflare "Just a moment" 盾页时，自动调用 FlareSolverr 无头浏览器过盾并注入 cf_clearance 后重试。
++ [新增] 设置项 `flaresolverr`（enabled/endpoint/solve_timeout_ms/request_timeout_secs/use_app_proxy），docker-compose 内置 flaresolverr 服务。
+
 ## 1.4.1 - 2026-06-03
 
 + [新增] 账号刷新改为异步模式，支持前端轮询刷新/重新登录进度。
