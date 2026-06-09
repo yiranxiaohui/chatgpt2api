@@ -208,9 +208,33 @@ def create_router() -> APIRouter:
         return {"items": auth_service.list_keys(role="user")}
 
     @router.get("/api/accounts")
-    async def get_accounts(authorization: str | None = Header(default=None)):
+    async def get_accounts(
+        authorization: str | None = Header(default=None),
+        page: int = 1,
+        page_size: int = 10,
+        q: str = "",
+        status: str = "all",
+        type: str = "all",
+    ):
         require_admin(authorization)
-        return {"items": account_service.list_accounts()}
+        return account_service.query_accounts(
+            page=page,
+            page_size=page_size,
+            query=q,
+            status=status,
+            account_type=type,
+        )
+
+    @router.get("/api/accounts/all-tokens")
+    async def get_all_tokens(
+        authorization: str | None = Header(default=None),
+        q: str = "",
+        status: str = "all",
+        type: str = "all",
+    ):
+        """按当前筛选条件返回匹配的全部 access_token，供前端全选/全量操作使用。"""
+        require_admin(authorization)
+        return {"access_tokens": account_service.list_tokens_filtered(query=q, status=status, account_type=type)}
 
     @router.post("/api/accounts")
     async def create_accounts(body: AccountCreateRequest, authorization: str | None = Header(default=None)):
@@ -342,7 +366,7 @@ def create_router() -> APIRouter:
         account = account_service.update_account(access_token, updates)
         if account is None:
             raise HTTPException(status_code=404, detail={"error": "account not found"})
-        return {"item": account, "items": account_service.list_accounts()}
+        return {"item": account}
 
     @router.post("/api/accounts/oauth/start")
     async def start_oauth_login(

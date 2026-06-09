@@ -45,6 +45,7 @@ import {
 import {
   deleteAccounts,
   fetchAccounts,
+  fetchAllAccountTokens,
   fetchModels,
   fetchRefreshProgress,
   fetchReLoginProgress,
@@ -55,6 +56,7 @@ import {
   type Account,
   type AccountRefreshResponse,
   type AccountStatus,
+  type AccountSummary,
   type Model,
   type RefreshProgressResponse,
 } from "@/lib/api";
@@ -93,19 +95,19 @@ const metricCards = [
   { key: "quota", label: "剩余额度", color: "text-blue-500", icon: RefreshCw },
 ] as const;
 
+function formatCompact(value: number) {
+  if (value >= 1000) {
+    return `${(value / 1000).toFixed(1)}k`;
+  }
+  return String(value);
+}
+
 function isUnlimitedImageQuotaAccount(account: Account) {
   return account.type === "pro" || account.type === "prolite";
 }
 
 function imageQuotaUnknown(account: Account) {
   return Boolean(account.image_quota_unknown);
-}
-
-function formatCompact(value: number) {
-  if (value >= 1000) {
-    return `${(value / 1000).toFixed(1)}k`;
-  }
-  return String(value);
 }
 
 function formatQuota(account: Account) {
@@ -142,25 +144,14 @@ function formatRestoreAt(value?: string | null) {
   return { absolute, relative };
 }
 
-function formatQuotaSummary(accounts: Account[]) {
-  const availableAccounts = accounts.filter((account) => account.status === "正常");
-  if (availableAccounts.some(isUnlimitedImageQuotaAccount)) {
-    return "∞";
-  }
-  if (availableAccounts.some(imageQuotaUnknown)) {
-    return "未知";
-  }
-  return formatCompact(availableAccounts.reduce((sum, account) => sum + Math.max(0, account.quota), 0));
-}
-
 function maskToken(token?: string) {
   if (!token) return "—";
   if (token.length <= 18) return token;
   return `${token.slice(0, 16)}...${token.slice(-8)}`;
 }
 
-function downloadTokens(accounts: Account[]) {
-  const content = `${accounts.map((account) => account.access_token).join("\n")}\n`;
+function downloadTokens(tokens: string[]) {
+  const content = `${tokens.join("\n")}\n`;
   const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
@@ -221,15 +212,37 @@ function AccountsPageContent() {
   });
   const progressRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [refreshSummary, setRefreshSummary] = useState<Record<string, number | string> | null>(null);
+  // 服务端分页：accounts 仅为当前页；总数/汇总/类型选项均来自后端
+  const [total, setTotal] = useState(0);
+  const [serverSummary, setServerSummary] = useState<AccountSummary | null>(null);
+  const [serverTypes, setServerTypes] = useState<string[]>([]);
+
+  // 用 ref 保存最新筛选条件，供各操作完成后静默刷新当前页时读取，避免闭包过期
+  const queryStateRef = useRef({ page, pageSize, query, statusFilter, typeFilter });
+  queryStateRef.current = { page, pageSize, query, statusFilter, typeFilter };
 
   const loadAccounts = async (silent = false) => {
     if (!silent) {
       setIsLoading(true);
     }
+    const s = queryStateRef.current;
     try {
-      const data = await fetchAccounts();
+      const data = await fetchAccounts({
+        page: s.page,
+        page_size: Number(s.pageSize),
+        q: s.query.trim(),
+        status: s.statusFilter,
+        type: s.typeFilter,
+      });
       setAccounts(data.items);
-      setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => item.access_token === id)));
+      setTotal(data.total);
+      setServerSummary(data.summary);
+      setServerTypes(data.types);
+      // 若当前页超出范围（如删除后），回退到最后一页
+      const pc = Math.max(1, Math.ceil(data.total / Number(s.pageSize)));
+      if (s.page > pc) {
+        setPage(pc);
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : "加载账户失败";
       toast.error(message);
@@ -253,65 +266,59 @@ function AccountsPageContent() {
     }
   };
 
+  // 模型列表只在挂载时加载一次
   useEffect(() => {
     if (didLoadRef.current) {
       return;
     }
     didLoadRef.current = true;
-    void loadAccounts();
     void loadModels();
 
-    // 清理进度条定时器
     return () => {
       if (progressRef.current) clearInterval(progressRef.current);
     };
   }, []);
 
-  const filteredAccounts = useMemo(() => {
-    const normalizedQuery = query.trim().toLowerCase();
-    return accounts.filter((account) => {
-      const searchMatched =
-        normalizedQuery.length === 0 || (account.email ?? "").toLowerCase().includes(normalizedQuery);
-      const typeMatched = typeFilter === "all" || displayAccountType(account) === typeFilter;
-      const statusMatched = statusFilter === "all" || account.status === statusFilter;
-      return searchMatched && typeMatched && statusMatched;
-    });
-  }, [accounts, query, statusFilter, typeFilter]);
+  // 分页/筛选变化时向服务端请求当前页（搜索做去抖）
+  useEffect(() => {
+    const handle = setTimeout(() => {
+      void loadAccounts();
+    }, 250);
+    return () => clearTimeout(handle);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [page, pageSize, query, statusFilter, typeFilter]);
 
-  const pageCount = Math.max(1, Math.ceil(filteredAccounts.length / Number(pageSize)));
+  const pageCount = Math.max(1, Math.ceil(total / Number(pageSize)));
   const safePage = Math.min(page, pageCount);
   const startIndex = (safePage - 1) * Number(pageSize);
-  const currentRows = filteredAccounts.slice(startIndex, startIndex + Number(pageSize));
+  const currentRows = accounts;
   const allCurrentSelected =
     currentRows.length > 0 && currentRows.every((row) => selectedIds.includes(row.access_token));
 
+  // 汇总卡片：来自服务端全量统计
   const summary = useMemo(() => {
-    const total = accounts.length;
-    const active = accounts.filter((item) => item.status === "正常").length;
-    const limited = accounts.filter((item) => item.status === "限流").length;
-    const abnormal = accounts.filter((item) => item.status === "异常").length;
-    const disabled = accounts.filter((item) => item.status === "禁用").length;
-    const quota = formatQuotaSummary(accounts);
-
-    return { total, active, limited, abnormal, disabled, quota };
-  }, [accounts]);
+    const s = serverSummary;
+    const quota = !s ? "—" : s.quota_unlimited ? "∞" : s.quota_unknown ? "未知" : formatCompact(s.quota_sum);
+    return {
+      total: s?.total ?? 0,
+      active: s?.active ?? 0,
+      limited: s?.limited ?? 0,
+      abnormal: s?.abnormal ?? 0,
+      disabled: s?.disabled ?? 0,
+      quota,
+    };
+  }, [serverSummary]);
 
   const accountTypeOptions = useMemo(
     () => [
       { label: "全部类型", value: "all" },
-      ...Array.from(new Set(accounts.map(displayAccountType))).map((type) => ({ label: type, value: type })),
+      ...serverTypes.map((type) => ({ label: type, value: type })),
     ],
-    [accounts],
+    [serverTypes],
   );
 
-  const selectedTokens = useMemo(() => {
-    const selectedSet = new Set(selectedIds);
-    return accounts.filter((item) => selectedSet.has(item.access_token)).map((item) => item.access_token);
-  }, [accounts, selectedIds]);
-
-  const abnormalTokens = useMemo(() => {
-    return accounts.filter((item) => item.status === "异常").map((item) => item.access_token);
-  }, [accounts]);
+  // 选中项即 access_token 集合（可跨页）
+  const selectedTokens = selectedIds;
 
   const paginationItems = useMemo(() => {
     const items: (number | "...")[] = [];
@@ -336,14 +343,57 @@ function AccountsPageContent() {
     setIsDeleting(true);
     try {
       const data = await deleteAccounts(tokens);
-      setAccounts(data.items);
-      setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => item.access_token === id)));
+      const removedSet = new Set(tokens);
+      setSelectedIds((prev) => prev.filter((id) => !removedSet.has(id)));
+      await loadAccounts(true);
       toast.success(`删除 ${data.removed ?? 0} 个账户`);
     } catch (error) {
       const message = error instanceof Error ? error.message : "删除账户失败";
       toast.error(message);
     } finally {
       setIsDeleting(false);
+    }
+  };
+
+  // 一键刷新所有账号：先取全部 token，再走刷新流程
+  const handleRefreshAll = async () => {
+    try {
+      const { access_tokens } = await fetchAllAccountTokens();
+      if (access_tokens.length === 0) {
+        toast.error("没有需要刷新的账户");
+        return;
+      }
+      await handleRefreshAccounts(access_tokens);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "获取账号列表失败");
+    }
+  };
+
+  // 移除全部异常账号（跨页）
+  const handleRemoveAbnormal = async () => {
+    try {
+      const { access_tokens } = await fetchAllAccountTokens({ status: "异常" });
+      if (access_tokens.length === 0) {
+        toast.error("没有异常账号");
+        return;
+      }
+      await handleDeleteTokens(access_tokens);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "获取异常账号失败");
+    }
+  };
+
+  // 导出全部 token（跨页）
+  const handleExportAllTokens = async () => {
+    try {
+      const { access_tokens } = await fetchAllAccountTokens();
+      if (access_tokens.length === 0) {
+        toast.error("没有可导出的账号");
+        return;
+      }
+      downloadTokens(access_tokens);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "导出失败");
     }
   };
 
@@ -358,12 +408,8 @@ function AccountsPageContent() {
       try {
         const { progress_id } = await refreshAccounts(accessTokens);
         // 单账号：轮询等待完成
-        await pollRefreshProgress(progress_id, (progress) => {
-          if (progress.done && progress.result) {
-            setAccounts(progress.result.items);
-            setSelectedIds((prev) => prev.filter((id) => progress.result!.items.some((item) => item.access_token === id)));
-          }
-        });
+        await pollRefreshProgress(progress_id, () => {});
+        await loadAccounts(true);
       } catch (error) {
         const message = error instanceof Error ? error.message : "刷新账户失败";
         toast.error(message);
@@ -379,19 +425,7 @@ function AccountsPageContent() {
 
     setIsRefreshing(true);
 
-    // 计算非选中账号的基数（统计卡片联动用）
-    const selectedTokenSet = new Set(accessTokens);
-    const baseAccountsList = accounts.filter((a) => !selectedTokenSet.has(a.access_token));
-    const baseActive = baseAccountsList.filter((a) => a.status === "正常").length;
-    const baseLimited = baseAccountsList.filter((a) => a.status === "限流").length;
-    const baseAbnormal = baseAccountsList.filter((a) => a.status === "异常").length;
-    const baseDisabled = baseAccountsList.filter((a) => a.status === "禁用").length;
-    const baseNormalAccounts = baseAccountsList.filter((a) => a.status === "正常");
-    const baseHasUnlimited = baseNormalAccounts.some(isUnlimitedImageQuotaAccount);
-    const baseHasUnknown = baseNormalAccounts.some(imageQuotaUnknown);
-    const baseQuotaNum = baseNormalAccounts.reduce((s, a) => s + Math.max(0, a.quota), 0);
-
-    // 显示进度条（只显示当前任务，不含分类统计）
+    // 显示进度条（只显示当前任务进度，汇总卡片在完成后整体刷新）
     const total = accessTokens.length;
     setProgress({
       visible: true,
@@ -419,42 +453,17 @@ function AccountsPageContent() {
                 reject(new Error("刷新结果为空"));
                 return;
               }
-              // 更新最终进度显示
               setProgress((prev) => ({
                 ...prev,
                 current: prev.total,
                 message: "刷新完成",
               }));
-              // 清除联动统计
-              setRefreshSummary(null);
               resolve(p.result);
             } else {
-              // 实时更新进度
               setProgress((prev) => ({
                 ...prev,
                 current: p.processed,
               }));
-              // 实时更新统计卡片：基数 + 已刷新的累加结果
-              const runningActive = baseActive + ((p.status_counts?.["正常"]) ?? 0);
-              const runningLimited = baseLimited + ((p.status_counts?.["限流"]) ?? 0);
-              const runningAbnormal = baseAbnormal + ((p.status_counts?.["异常"]) ?? 0);
-              const runningDisabled = baseDisabled + ((p.status_counts?.["禁用"]) ?? 0);
-              let runningQuota: string | number;
-              if (baseHasUnlimited) {
-                runningQuota = "∞";
-              } else if (baseHasUnknown) {
-                runningQuota = "未知";
-              } else {
-                runningQuota = formatCompact(baseQuotaNum + (p.total_quota ?? 0));
-              }
-              setRefreshSummary({
-                total: accounts.length,
-                active: runningActive,
-                limited: runningLimited,
-                abnormal: runningAbnormal,
-                disabled: runningDisabled,
-                quota: runningQuota,
-              });
             }
           } catch (err) {
             clearInterval(pollTimer);
@@ -463,9 +472,8 @@ function AccountsPageContent() {
         }, 300);
       });
 
-      // 刷新完成，更新数据
-      setAccounts(data.items);
-      setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => item.access_token === id)));
+      // 刷新完成，重新拉取当前页与汇总
+      await loadAccounts(true);
 
       const relogined = data.relogined ?? 0;
 
@@ -560,11 +568,15 @@ function AccountsPageContent() {
       return;
     }
 
-    // 只处理异常账号，过滤非异常账号
-    const abnormalTokens = accessTokens.filter((token) => {
-      const account = accounts.find((a) => a.access_token === token);
-      return account?.status === "异常";
-    });
+    // 只处理异常账号：跨页取全部异常 token 后与选中项求交集
+    let abnormalTokens = accessTokens;
+    try {
+      const { access_tokens } = await fetchAllAccountTokens({ status: "异常" });
+      const abnormalSet = new Set(access_tokens);
+      abnormalTokens = accessTokens.filter((token) => abnormalSet.has(token));
+    } catch {
+      /* 取异常列表失败则按原样提交，后端会自行跳过非异常账号 */
+    }
 
     if (abnormalTokens.length === 0) {
       toast.error("选中账号中没有异常账号");
@@ -576,14 +588,6 @@ function AccountsPageContent() {
     }
 
     setIsRelogining(true);
-
-    // 计算非选中账号的基数（统计卡片联动用）
-    const selectedTokenSet = new Set(abnormalTokens);
-    const baseAccountsList = accounts.filter((a) => !selectedTokenSet.has(a.access_token));
-    const baseActive = baseAccountsList.filter((a) => a.status === "正常").length;
-    const baseLimited = baseAccountsList.filter((a) => a.status === "限流").length;
-    const baseAbnormal = baseAccountsList.filter((a) => a.status === "异常").length;
-    const baseDisabled = baseAccountsList.filter((a) => a.status === "禁用").length;
 
     // 显示进度条（真实进度）
     const total = abnormalTokens.length;
@@ -604,7 +608,6 @@ function AccountsPageContent() {
                 return;
               }
               setProgress((prev) => ({ ...prev, current: prev.total, message: "恢复流程已完成" }));
-              setRefreshSummary(null);
               resolve();
             } else {
               // 实时更新进度
@@ -620,29 +623,6 @@ function AccountsPageContent() {
                 email: emailHint,
                 message: "正在尝试恢复异常账号...",
               }));
-
-              // 实时更新统计卡片：基数 + 已处理的恢复结果
-              let runningActive = baseActive;
-              let runningAbnormal = baseAbnormal;
-              let runningDisabled = baseDisabled;
-              for (const r of results) {
-                if (r.status === "成功") {
-                  runningActive += 1;
-                  runningAbnormal -= 1;
-                } else if (r.status === "禁用") {
-                  runningDisabled += 1;
-                  runningAbnormal -= 1;
-                }
-                // "异常"或"跳过"：保持异常状态不变
-              }
-              setRefreshSummary({
-                total: accounts.length,
-                active: runningActive,
-                limited: baseLimited,
-                abnormal: runningAbnormal,
-                disabled: runningDisabled,
-                quota: summary.quota,
-              });
             }
           } catch (err) {
             clearInterval(pollTimer);
@@ -653,11 +633,7 @@ function AccountsPageContent() {
 
       // 等待后台线程完成，再拉取最新数据
       await new Promise<void>((resolve) => setTimeout(resolve, 500));
-      try {
-        const freshData = await fetchAccounts();
-        setAccounts(freshData.items);
-        setSelectedIds((prev) => prev.filter((id) => freshData.items.some((item) => item.access_token === id)));
-      } catch { /* 静默失败 */ }
+      await loadAccounts(true);
 
       setProgress({
         visible: true,
@@ -711,13 +687,12 @@ function AccountsPageContent() {
 
     setIsUpdating(true);
     try {
-      const data = await updateAccount(editingAccount.access_token, {
+      await updateAccount(editingAccount.access_token, {
         status: editStatus,
         proxy: editProxy.trim(),
       });
-      setAccounts(data.items);
-      setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => item.access_token === id)));
       setEditingAccount(null);
+      await loadAccounts(true);
       toast.success("账号信息已更新");
     } catch (error) {
       const message = error instanceof Error ? error.message : "更新账号失败";
@@ -758,25 +733,25 @@ function AccountsPageContent() {
           <Button
             variant="outline"
             className="h-10 rounded-xl border-stone-200 bg-white/80 px-4 text-stone-700 hover:bg-white"
-            onClick={() => void handleRefreshAccounts(accounts.map((item) => item.access_token))}
-            disabled={isLoading || isRefreshing || isDeleting || accounts.length === 0}
+            onClick={() => void handleRefreshAll()}
+            disabled={isLoading || isRefreshing || isDeleting || total === 0}
           >
             <RefreshCw className={cn("size-4", isRefreshing ? "animate-spin" : "")} />
             一键刷新所有账号信息和额度
           </Button>
           <AccountImportDialog
             disabled={isLoading || isRefreshing || isDeleting}
-            onImported={(items) => {
-              setAccounts(items);
+            onImported={() => {
               setSelectedIds([]);
               setPage(1);
+              void loadAccounts(true);
             }}
           />
           <Button
             variant="outline"
             className="h-10 rounded-xl border-stone-200 bg-white/80 px-4 text-stone-700 hover:bg-white"
-            onClick={() => downloadTokens(accounts)}
-            disabled={accounts.length === 0}
+            onClick={() => void handleExportAllTokens()}
+            disabled={total === 0}
           >
             <Download className="size-4" />
             导出全部 Token
@@ -940,7 +915,7 @@ function AccountsPageContent() {
           <div className="flex items-center gap-3">
             <h2 className="text-lg font-semibold tracking-tight">账户列表</h2>
             <Badge variant="secondary" className="rounded-lg bg-stone-200 px-2 py-0.5 text-stone-700">
-              {filteredAccounts.length}
+              {total}
             </Badge>
           </div>
 
@@ -1041,8 +1016,8 @@ function AccountsPageContent() {
                 <Button
                   variant="ghost"
                   className="h-8 rounded-lg px-3 text-rose-500 hover:bg-rose-50 hover:text-rose-600"
-                  onClick={() => void handleDeleteTokens(abnormalTokens)}
-                  disabled={abnormalTokens.length === 0 || isDeleting}
+                  onClick={() => void handleRemoveAbnormal()}
+                  disabled={summary.abnormal === 0 || isDeleting}
                 >
                   {isDeleting ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
                   移除异常账号
@@ -1227,9 +1202,9 @@ function AccountsPageContent() {
             <div className="border-t border-stone-100 px-4 py-4">
               <div className="flex items-center justify-center gap-3 overflow-x-auto whitespace-nowrap">
                 <div className="shrink-0 text-sm text-stone-500">
-                显示第 {filteredAccounts.length === 0 ? 0 : startIndex + 1} -{" "}
-                {Math.min(startIndex + Number(pageSize), filteredAccounts.length)} 条，共{" "}
-                {filteredAccounts.length} 条
+                显示第 {total === 0 ? 0 : startIndex + 1} -{" "}
+                {Math.min(startIndex + Number(pageSize), total)} 条，共{" "}
+                {total} 条
                 </div>
 
                 <span className="shrink-0 text-sm leading-none text-stone-500">

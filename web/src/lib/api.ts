@@ -57,8 +57,32 @@ export type Model = {
   parent: string | null;
 };
 
+export type AccountSummary = {
+  total: number;
+  active: number;
+  limited: number;
+  abnormal: number;
+  disabled: number;
+  quota_unlimited: boolean;
+  quota_unknown: boolean;
+  quota_sum: number;
+};
+
+export type AccountQueryParams = {
+  page?: number;
+  page_size?: number;
+  q?: string;
+  status?: string;
+  type?: string;
+};
+
 type AccountListResponse = {
   items: Account[];
+  total: number;
+  page: number;
+  page_size: number;
+  summary: AccountSummary;
+  types: string[];
 };
 
 type ModelListResponse = {
@@ -312,8 +336,23 @@ export async function login(authKey: string) {
   });
 }
 
-export async function fetchAccounts() {
-  return httpRequest<AccountListResponse>("/api/accounts");
+function buildAccountQuery(params: { page?: number; page_size?: number; q?: string; status?: string; type?: string }) {
+  const sp = new URLSearchParams();
+  if (params.page != null) sp.set("page", String(params.page));
+  if (params.page_size != null) sp.set("page_size", String(params.page_size));
+  if (params.q) sp.set("q", params.q);
+  if (params.status && params.status !== "all") sp.set("status", params.status);
+  if (params.type && params.type !== "all") sp.set("type", params.type);
+  const qs = sp.toString();
+  return qs ? `?${qs}` : "";
+}
+
+export async function fetchAccounts(params: AccountQueryParams = {}) {
+  return httpRequest<AccountListResponse>(`/api/accounts${buildAccountQuery(params)}`);
+}
+
+export async function fetchAllAccountTokens(params: { q?: string; status?: string; type?: string } = {}) {
+  return httpRequest<{ access_tokens: string[] }>(`/api/accounts/all-tokens${buildAccountQuery(params)}`);
 }
 
 export async function fetchModels() {

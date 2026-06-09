@@ -63,6 +63,47 @@ class DatabaseStorageBackend(StorageBackend):
         """保存账号数据到数据库"""
         self._save_rows(AccountModel, accounts, "access_token")
 
+    def upsert_account(self, account: dict[str, Any]) -> None:
+        """单行 upsert：只写改动的那一个账号，避免全表重写。"""
+        access_token = str(account.get("access_token") or "").strip()
+        if not access_token:
+            return
+        session = self.Session()
+        try:
+            row = (
+                session.query(AccountModel)
+                .filter(AccountModel.access_token == access_token)
+                .one_or_none()
+            )
+            data = json.dumps(account, ensure_ascii=False)
+            if row is None:
+                session.add(AccountModel(access_token=access_token, data=data))
+            else:
+                row.data = data
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def delete_account(self, access_token: str) -> None:
+        """单行删除。"""
+        access_token = str(access_token or "").strip()
+        if not access_token:
+            return
+        session = self.Session()
+        try:
+            session.query(AccountModel).filter(
+                AccountModel.access_token == access_token
+            ).delete()
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
     def load_auth_keys(self) -> list[dict[str, Any]]:
         """从数据库加载鉴权密钥数据"""
         return self._load_rows(AuthKeyModel)

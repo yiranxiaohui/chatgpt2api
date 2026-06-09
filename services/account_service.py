@@ -128,6 +128,24 @@ class AccountService:
     def _save_accounts(self) -> None:
         self.storage.save_accounts(list(self._accounts.values()))
 
+    def _persist_upsert(self, account: dict) -> None:
+        """增量持久化单个账号；失败则回退到全量保存以保证不丢数据。"""
+        try:
+            self.storage.upsert_account(dict(account))
+        except Exception as exc:
+            print(f"[storage] upsert_account failed, fallback to full save: {exc}")
+            self._save_accounts()
+
+    def _persist_delete(self, *access_tokens: str) -> None:
+        """增量删除若干账号；失败则回退到全量保存。"""
+        try:
+            for token in access_tokens:
+                if token:
+                    self.storage.delete_account(token)
+        except Exception as exc:
+            print(f"[storage] delete_account failed, fallback to full save: {exc}")
+            self._save_accounts()
+
     @staticmethod
     def _is_image_account_available(account: dict) -> bool:
         if not isinstance(account, dict):
@@ -316,7 +334,7 @@ class AccountService:
             account = self._normalize_account(next_item)
             if account is not None:
                 self._accounts[resolved] = account
-                self._save_accounts()
+                self._persist_upsert(account)
         log_service.add(
             LOG_TYPE_ACCOUNT,
             "refresh_token 刷新 access_token 失败",
@@ -427,7 +445,9 @@ class AccountService:
                 if old_inflight:
                     self._image_inflight[new_token] = int(self._image_inflight.get(new_token, 0)) + old_inflight
             self._accounts[new_token] = account
-            self._save_accounts()
+            if rotated:
+                self._persist_delete(old_token)
+            self._persist_upsert(account)
             self._image_slot_condition.notify_all()
 
         log_service.add(
@@ -869,7 +889,7 @@ class AccountService:
     def keepalive_refresh_tokens(self, access_tokens: list[str]) -> dict[str, Any]:
         access_tokens = list(dict.fromkeys(token for token in access_tokens if token))
         if not access_tokens:
-            return {"refreshed": 0, "errors": [], "items": self.list_accounts()}
+            return {"refreshed": 0, "errors": [], "items": []}
 
         refreshed = 0
         errors = []
@@ -889,7 +909,7 @@ class AccountService:
         return {
             "refreshed": refreshed,
             "errors": errors,
-            "items": self.list_accounts(),
+            "items": [],
             "relogined": 0,
         }
 
@@ -1038,7 +1058,7 @@ class AccountService:
             if account is None:
                 return
             self._accounts[access_token] = account
-            self._save_accounts()
+            self._persist_upsert(account)
 
     def remove_invalid_token(self, access_token: str, event: str, quiet: bool = False) -> bool:
         if not config.auto_remove_invalid_accounts:
@@ -1063,6 +1083,110 @@ class AccountService:
     def list_accounts(self) -> list[dict]:
         with self._lock:
             return [dict(item) for item in self._accounts.values()]
+
+    # 列表展示用的精简字段：去掉 token 三件套里体积大且列表不需要的明文，
+    # 既大幅压小分页响应，也避免在列表接口里下发 refresh_token/id_token/password。
+    _LIST_OMIT_FIELDS = ("refresh_token", "id_token", "password")
+
+    @classmethod
+    def _slim_account(cls, account: dict) -> dict:
+        return {k: v for k, v in account.items() if k not in cls._LIST_OMIT_FIELDS}
+
+    @staticmethod
+    def _display_type(account: dict) -> str:
+        return str(account.get("type") or "").strip() or "Free"
+
+    @staticmethod
+    def _account_matches_query(account: dict, query: str) -> bool:
+        if not query:
+            return True
+        return query in str(account.get("email") or "").lower()
+
+    def query_accounts(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 10,
+        query: str = "",
+        status: str = "all",
+        account_type: str = "all",
+    ) -> dict:
+        """服务端分页/筛选/精简字段 + 全局汇总，避免一次性下发整个号池。"""
+        query = str(query or "").strip().lower()
+        status = str(status or "all").strip() or "all"
+        account_type = str(account_type or "all").strip() or "all"
+        try:
+            page = max(1, int(page))
+        except (TypeError, ValueError):
+            page = 1
+        try:
+            page_size = min(500, max(1, int(page_size)))
+        except (TypeError, ValueError):
+            page_size = 10
+
+        with self._lock:
+            accounts = list(self._accounts.values())
+
+        # 全局汇总（始终基于全量，与筛选无关，匹配前端汇总卡片）
+        summary = {"total": len(accounts), "active": 0, "limited": 0, "abnormal": 0, "disabled": 0}
+        status_key = {"正常": "active", "限流": "limited", "异常": "abnormal", "禁用": "disabled"}
+        type_set: set[str] = set()
+        quota_unlimited = False
+        quota_unknown = False
+        quota_sum = 0
+        for account in accounts:
+            key = status_key.get(str(account.get("status") or ""))
+            if key:
+                summary[key] += 1
+            type_set.add(self._display_type(account))
+            if account.get("status") == "正常":
+                if self._display_type(account).lower() in ("pro", "prolite"):
+                    quota_unlimited = True
+                elif bool(account.get("image_quota_unknown")):
+                    quota_unknown = True
+                else:
+                    quota_sum += max(0, int(account.get("quota") or 0))
+        summary["quota_unlimited"] = quota_unlimited
+        summary["quota_unknown"] = quota_unknown
+        summary["quota_sum"] = quota_sum
+
+        # 筛选
+        filtered = [
+            account
+            for account in accounts
+            if (status == "all" or account.get("status") == status)
+            and (account_type == "all" or self._display_type(account) == account_type)
+            and self._account_matches_query(account, query)
+        ]
+
+        total = len(filtered)
+        start = (page - 1) * page_size
+        page_items = filtered[start:start + page_size]
+
+        return {
+            "items": [self._slim_account(account) for account in page_items],
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "summary": summary,
+            "types": sorted(type_set),
+        }
+
+    def list_tokens_filtered(self, *, query: str = "", status: str = "all", account_type: str = "all") -> list[str]:
+        """按当前筛选条件返回匹配的全部 access_token（供全选/全量刷新等批量操作用）。"""
+        query = str(query or "").strip().lower()
+        status = str(status or "all").strip() or "all"
+        account_type = str(account_type or "all").strip() or "all"
+        with self._lock:
+            accounts = list(self._accounts.values())
+        return [
+            token
+            for account in accounts
+            if (status == "all" or account.get("status") == status)
+            and (account_type == "all" or self._display_type(account) == account_type)
+            and self._account_matches_query(account, query)
+            and (token := str(account.get("access_token") or ""))
+        ]
 
     def list_limited_tokens(self) -> list[str]:
         with self._lock:
@@ -1109,7 +1233,7 @@ class AccountService:
     def add_accounts(self, tokens: list[str], source_type: str = "web") -> dict:
         tokens = list(dict.fromkeys(token for token in tokens if token))
         if not tokens:
-            return {"added": 0, "skipped": 0, "items": self.list_accounts()}
+            return {"added": 0, "skipped": 0, "items": []}
         return self._add_account_payloads([
             {"access_token": token, "source_type": self._normalize_source_type(source_type)}
             for token in tokens
@@ -1127,7 +1251,7 @@ class AccountService:
             deduped[access_token] = {**current, **payload, "access_token": access_token}
 
         if not deduped:
-            return {"added": 0, "skipped": 0, "items": self.list_accounts()}
+            return {"added": 0, "skipped": 0, "items": []}
 
         with self._lock:
             added = 0
@@ -1154,16 +1278,15 @@ class AccountService:
                 )
                 if account is not None:
                     self._accounts[access_token] = account
-            self._save_accounts()
-            items = [dict(item) for item in self._accounts.values()]
+                    self._persist_upsert(account)
             log_service.add(LOG_TYPE_ACCOUNT, f"新增 {added} 个账号，跳过 {skipped} 个",
                             {"added": added, "skipped": skipped})
-        return {"added": added, "skipped": skipped, "items": items}
+        return {"added": added, "skipped": skipped, "items": []}
 
     def delete_accounts(self, tokens: list[str]) -> dict:
         target_set = set(token for token in tokens if token)
         if not target_set:
-            return {"removed": 0, "items": self.list_accounts()}
+            return {"removed": 0, "items": []}
         with self._lock:
             target_set = {self._resolve_access_token_locked(token) for token in target_set if token}
             removed = sum(self._accounts.pop(token, None) is not None for token in target_set)
@@ -1179,10 +1302,9 @@ class AccountService:
                     self._index %= len(self._accounts)
                 else:
                     self._index = 0
-                self._save_accounts()
+                self._persist_delete(*target_set)
                 log_service.add(LOG_TYPE_ACCOUNT, f"删除 {removed} 个账号", {"removed": removed})
-            items = [dict(item) for item in self._accounts.values()]
-        return {"removed": removed, "items": items}
+        return {"removed": removed, "items": []}
 
     def update_account(self, access_token: str, updates: dict, quiet: bool = False) -> dict | None:
         if not access_token:
@@ -1197,11 +1319,11 @@ class AccountService:
                 return None
             if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
                 self._accounts.pop(access_token, None)
-                self._save_accounts()
+                self._persist_delete(access_token)
                 log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
                 return None
             self._accounts[access_token] = account
-            self._save_accounts()
+            self._persist_upsert(account)
             if not quiet:
                 log_service.add(LOG_TYPE_ACCOUNT, "更新账号",
                                 {"token": anonymize_token(access_token), "status": account.get("status")})
@@ -1259,7 +1381,7 @@ class AccountService:
             account = self._normalize_account(next_item)
             if account is not None:
                 self._accounts[access_token] = account
-                self._save_accounts()
+                self._persist_upsert(account)
             if should_defer:
                 log_service.add(
                     LOG_TYPE_ACCOUNT,
@@ -1297,11 +1419,11 @@ class AccountService:
                 return None
             if account.get("status") == "限流" and config.auto_remove_rate_limited_accounts:
                 self._accounts.pop(access_token, None)
-                self._save_accounts()
+                self._persist_delete(access_token)
                 log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
                 return None
             self._accounts[access_token] = account
-            self._save_accounts()
+            self._persist_upsert(account)
             return dict(account)
         return None
 
@@ -1453,8 +1575,7 @@ class AccountService:
     ) -> dict[str, Any]:
         access_tokens = list(dict.fromkeys(token for token in access_tokens if token))
         if not access_tokens:
-            items = self.list_accounts()
-            result = {"refreshed": 0, "errors": [], "items": items, "relogined": 0}
+            result = {"refreshed": 0, "errors": [], "items": [], "relogined": 0}
             if progress_id:
                 self.finish_refresh_progress(progress_id, result)
             return result
@@ -1524,7 +1645,7 @@ class AccountService:
         result = {
             "refreshed": refreshed,
             "errors": errors,
-            "items": self.list_accounts(),
+            "items": [],
             "relogined": relogined,
         }
 
@@ -1541,7 +1662,7 @@ class AccountService:
         """
         access_tokens = list(dict.fromkeys(token for token in access_tokens if token))
         if not access_tokens:
-            result = {"relogined": 0, "skipped": 0, "errors": [], "items": self.list_accounts()}
+            result = {"relogined": 0, "skipped": 0, "errors": [], "items": []}
             if progress_id:
                 self.finish_relogin_progress(progress_id, result)
             return result
@@ -1582,7 +1703,7 @@ class AccountService:
             "relogined": relogined,
             "skipped": skipped,
             "errors": errors,
-            "items": self.list_accounts(),
+            "items": [],
         }
         if progress_id:
             # 如果所有账号都已同步处理完毕（没有启动线程），直接标记完成
