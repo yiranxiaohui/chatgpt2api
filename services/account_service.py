@@ -635,27 +635,35 @@ class AccountService:
                 "auth0Client": platform_auth0_client,
             }
             authorize_url = f"{auth_base}/api/accounts/authorize?{urlencode(params)}"
-            resp = session.get(
-                authorize_url,
-                headers={
-                    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                    "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
-                    "user-agent": user_agent,
-                    "sec-ch-ua": '"Chromium";v="145", "Google Chrome";v="145", "Not/A)Brand";v="99"',
-                    "sec-ch-ua-mobile": "?0",
-                    "sec-ch-ua-platform": '"Windows"',
-                    "sec-fetch-dest": "document",
-                    "sec-fetch-mode": "navigate",
-                    "sec-fetch-site": "cross-site",
-                    "sec-fetch-user": "?1",
-                    "upgrade-insecure-requests": "1",
-                    "referer": "https://platform.openai.com/",
-                },
-                allow_redirects=True,
-                timeout=30,
-            )
-            
+            navigate_headers = {
+                "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+                "user-agent": user_agent,
+                "sec-ch-ua": '"Chromium";v="145", "Google Chrome";v="145", "Not/A)Brand";v="99"',
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"Windows"',
+                "sec-fetch-dest": "document",
+                "sec-fetch-mode": "navigate",
+                "sec-fetch-site": "cross-site",
+                "sec-fetch-user": "?1",
+                "upgrade-insecure-requests": "1",
+                "referer": "https://platform.openai.com/",
+            }
+            resp = session.get(authorize_url, headers=navigate_headers, allow_redirects=True, timeout=30)
+
+            # 命中 Cloudflare 盾页时，用 FlareSolverr 过盾后携带 cf_clearance 重试
+            from services import flaresolverr_service
+            if flaresolverr_service.is_cloudflare_challenge(resp) and flaresolverr_service.is_enabled():
+                solved_ua = flaresolverr_service.solve_and_apply(session, f"{auth_base}/", proxy=proxy)
+                if solved_ua:
+                    # cf_clearance 绑定 UA：整条登录会话改用过盾返回的 UA
+                    user_agent = solved_ua
+                    navigate_headers["user-agent"] = solved_ua
+                    resp = session.get(authorize_url, headers=navigate_headers, allow_redirects=True, timeout=30)
+
             if resp.status_code not in (200, 302):
+                if flaresolverr_service.is_cloudflare_challenge(resp):
+                    return {"ok": False, "error": "cloudflare_challenge", "detail": {"url": str(resp.url), "hint": "FlareSolverr 未启用或过盾失败，请更换 IP"}}
                 return {"ok": False, "error": f"authorize_failed_{resp.status_code}", "detail": {"url": resp.url, "text": resp.text[:500]}}
             
             # 检测最终 URL 是否指向错误页面

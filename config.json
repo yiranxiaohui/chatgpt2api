@@ -70,6 +70,13 @@
     "drop_adjacent_duplicates": true,
     "drop_assistant_history": false
   },
+  "flaresolverr": {
+    "enabled": false,
+    "endpoint": "http://flaresolverr:8191/v1",
+    "solve_timeout_ms": 60000,
+    "request_timeout_secs": 90,
+    "use_app_proxy": true
+  },
   "image_settle_enabled": false,
   "image_check_before_hit_enabled": false,
   "image_settle_secs": 2,

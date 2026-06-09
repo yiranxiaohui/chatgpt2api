@@ -18,6 +18,7 @@ from curl_cffi import requests
 
 from services.account_service import account_service
 from services.register import mail_provider
+from services import flaresolverr_service
 
 base_dir = Path(__file__).resolve().parent
 config = {
@@ -214,9 +215,12 @@ def wait_for_code(mailbox: dict) -> str | None:
 from utils.sentinel import SentinelTokenGenerator, build_sentinel_token as _build_sentinel_token_tuple  # noqa: F401
 
 
-def build_sentinel_token(session: requests.Session, device_id: str, flow: str) -> str:
-    """请求 sentinel token，返回 sentinel header 字符串（兼容旧接口）。"""
-    sentinel_val, _oai_sc_val = _build_sentinel_token_tuple(session, device_id, flow, user_agent=user_agent, sec_ch_ua=sec_ch_ua)
+def build_sentinel_token(session: requests.Session, device_id: str, flow: str, ua: str = "") -> str:
+    """请求 sentinel token，返回 sentinel header 字符串（兼容旧接口）。
+
+    ``ua`` 用于过盾后统一 User-Agent；为空则回退到默认 ``user_agent``。
+    """
+    sentinel_val, _oai_sc_val = _build_sentinel_token_tuple(session, device_id, flow, user_agent=ua or user_agent, sec_ch_ua=sec_ch_ua)
     return sentinel_val
 
 
@@ -238,15 +242,17 @@ def request_with_local_retry(session: requests.Session, method: str, url: str, r
     return None, last_error
 
 
-def validate_otp(session: requests.Session, device_id: str, code: str):
+def validate_otp(session: requests.Session, device_id: str, code: str, ua: str = ""):
     headers = dict(common_headers)
     headers["referer"] = f"{auth_base}/email-verification"
     headers["oai-device-id"] = device_id
+    if ua:
+        headers["user-agent"] = ua
     headers.update(_make_trace_headers())
     resp, error = request_with_local_retry(session, "post", f"{auth_base}/api/accounts/email-otp/validate", json={"code": code}, headers=headers, verify=False)
     if resp is not None and resp.status_code == 200:
         return resp, ""
-    headers["openai-sentinel-token"] = build_sentinel_token(session, device_id, "authorize_continue")
+    headers["openai-sentinel-token"] = build_sentinel_token(session, device_id, "authorize_continue", ua=ua)
     resp, error = request_with_local_retry(session, "post", f"{auth_base}/api/accounts/email-otp/validate", json={"code": code}, headers=headers, verify=False)
     return resp, error
 
@@ -304,16 +310,20 @@ def request_platform_oauth_token(session: requests.Session, code: str, code_veri
 
 class PlatformRegistrar:
     def __init__(self, proxy: str = "") -> None:
+        self.proxy = proxy
         self.session = create_session(proxy)
         self.device_id = str(uuid.uuid4())
         self.code_verifier = ""
         self.platform_auth_code = ""
+        # 过盾后整条会话统一改用 FlareSolverr 返回的 User-Agent
+        self.user_agent = user_agent
 
     def close(self) -> None:
         self.session.close()
 
     def _navigate_headers(self, referer: str = "") -> dict[str, str]:
         headers = dict(navigate_headers)
+        headers["user-agent"] = self.user_agent
         if referer:
             headers["referer"] = referer
         return headers
@@ -322,6 +332,7 @@ class PlatformRegistrar:
         headers = dict(common_headers)
         headers["referer"] = referer
         headers["oai-device-id"] = self.device_id
+        headers["user-agent"] = self.user_agent
         headers.update(_make_trace_headers())
         return headers
 
@@ -348,21 +359,42 @@ class PlatformRegistrar:
             "code_challenge_method": "S256",
             "auth0Client": platform_auth0_client,
         }
-        resp, error = request_with_local_retry(self.session, "get", f"{auth_base}/api/accounts/authorize?{urlencode(params)}", headers=self._navigate_headers(f"{platform_base}/"), allow_redirects=True, verify=False)
+        authorize_url = f"{auth_base}/api/accounts/authorize?{urlencode(params)}"
+        resp, error = request_with_local_retry(self.session, "get", authorize_url, headers=self._navigate_headers(f"{platform_base}/"), allow_redirects=True, verify=False)
+        if (resp is None or resp.status_code != 200) and _is_cloudflare_challenge(resp):
+            resp, error = self._solve_cloudflare_and_retry(authorize_url, index)
         if resp is None or resp.status_code != 200:
             err = _response_json(resp).get("error", {}) if resp is not None else {}
             detail = f": {err.get('code', '')} - {err.get('message', '')}".strip(" -") if err else ""
             if _is_cloudflare_challenge(resp):
-                raise RuntimeError("被 Cloudflare 拦截，请更换 IP 重试")
+                raise RuntimeError("被 Cloudflare 拦截，请更换 IP 重试（FlareSolverr 未启用或过盾失败）")
             debug = _response_debug_detail(resp)
             status = getattr(resp, "status_code", "unknown")
             raise RuntimeError(error or f"platform_authorize_http_{status}{detail}, {debug}")
         step(index, "platform authorize 完成")
 
+    def _solve_cloudflare_and_retry(self, authorize_url: str, index: int):
+        """撞 Cloudflare 盾页时调用 FlareSolverr 过盾，注入 cf_clearance 后重试 authorize。"""
+        if not flaresolverr_service.is_enabled():
+            return None, ""
+        step(index, "命中 Cloudflare 盾页，尝试 FlareSolverr 过盾", "yellow")
+        solved_ua = flaresolverr_service.solve_and_apply(self.session, f"{auth_base}/", proxy=self.proxy)
+        if not solved_ua:
+            step(index, "FlareSolverr 过盾失败", "red")
+            return None, "flaresolverr_failed"
+        # cf_clearance 绑定 UA：整条会话改用过盾返回的 UA
+        self.user_agent = solved_ua
+        step(index, "FlareSolverr 过盾成功，携带 cf_clearance 重试", "green")
+        return request_with_local_retry(
+            self.session, "get", authorize_url,
+            headers=self._navigate_headers(f"{platform_base}/"),
+            allow_redirects=True, verify=False,
+        )
+
     def _register_user(self, email: str, password: str, index: int) -> None:
         step(index, "开始提交注册密码")
         headers = self._json_headers(f"{auth_base}/create-account/password")
-        headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "username_password_create")
+        headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "username_password_create", ua=self.user_agent)
         resp, error = request_with_local_retry(self.session, "post", f"{auth_base}/api/accounts/user/register", json={"username": email, "password": password}, headers=headers, verify=False)
         if resp is None or resp.status_code != 200:
             data = _response_json(resp) if resp is not None else {}
@@ -381,7 +413,7 @@ class PlatformRegistrar:
 
     def _validate_otp(self, code: str, index: int) -> None:
         step(index, f"开始校验验证码 {code}")
-        resp, error = validate_otp(self.session, self.device_id, code)
+        resp, error = validate_otp(self.session, self.device_id, code, ua=self.user_agent)
         if resp is None or resp.status_code != 200:
             body = ""
             try:
@@ -394,7 +426,7 @@ class PlatformRegistrar:
     def _create_account(self, name: str, birthdate: str, index: int) -> None:
         step(index, "开始创建账号资料")
         headers = self._json_headers(f"{auth_base}/about-you")
-        headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "oauth_create_account")
+        headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "oauth_create_account", ua=self.user_agent)
         resp, error = request_with_local_retry(self.session, "post", f"{auth_base}/api/accounts/create_account", json={"name": name, "birthdate": birthdate}, headers=headers, verify=False)
         if resp is None or resp.status_code not in (200, 302):
             data = _response_json(resp) if resp is not None else {}

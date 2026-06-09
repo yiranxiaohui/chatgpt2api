@@ -27,3 +27,20 @@ services:
       
       # 基础 URL (可选)
       # - CHATGPT2API_BASE_URL=https://your-domain.com
+    depends_on:
+      - flaresolverr
+
+  # FlareSolverr：注册/登录撞 Cloudflare "Just a moment" 盾页时，
+  # 由它的无头浏览器过盾并回吐 cf_clearance。
+  # 在面板「设置」里把 flaresolverr.enabled 打开即可启用（endpoint 默认指向本服务名）。
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    restart: unless-stopped
+    environment:
+      - LOG_LEVEL=info
+      - TZ=Asia/Shanghai
+    # 仅供同 compose 网络内的 app 调用，无需对外暴露端口；
+    # 如需本机调试可取消下面注释。
+    # ports:
+    #   - "8191:8191"

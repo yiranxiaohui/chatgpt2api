@@ -48,6 +48,16 @@ DEFAULT_CHAT_COMPLETION_CACHE = {
     "drop_assistant_history": False,
 }
 
+DEFAULT_FLARESOLVERR = {
+    "enabled": False,
+    # FlareSolverr /v1 接口地址；与本服务在同一 compose 网络时用服务名即可
+    "endpoint": "http://flaresolverr:8191/v1",
+    "solve_timeout_ms": 60000,
+    "request_timeout_secs": 90,
+    # 把本服务 proxy 透传给 FlareSolverr，保证 cf_clearance 与出口 IP 一致
+    "use_app_proxy": True,
+}
+
 
 def _normalize_bool(value: object, default: bool = False) -> bool:
     if isinstance(value, str):
@@ -159,6 +169,28 @@ def _normalize_chat_completion_cache_settings(value: object) -> dict[str, object
         "drop_assistant_history": _normalize_bool(
             source.get("drop_assistant_history"),
             bool(DEFAULT_CHAT_COMPLETION_CACHE["drop_assistant_history"]),
+        ),
+    }
+
+
+def _normalize_flaresolverr_settings(value: object) -> dict[str, object]:
+    source = value if isinstance(value, dict) else {}
+    return {
+        "enabled": _normalize_bool(source.get("enabled"), bool(DEFAULT_FLARESOLVERR["enabled"])),
+        "endpoint": str(source.get("endpoint") or DEFAULT_FLARESOLVERR["endpoint"]).strip(),
+        "solve_timeout_ms": _normalize_positive_int(
+            source.get("solve_timeout_ms"),
+            int(DEFAULT_FLARESOLVERR["solve_timeout_ms"]),
+            1000,
+        ),
+        "request_timeout_secs": _normalize_positive_int(
+            source.get("request_timeout_secs"),
+            int(DEFAULT_FLARESOLVERR["request_timeout_secs"]),
+            5,
+        ),
+        "use_app_proxy": _normalize_bool(
+            source.get("use_app_proxy"),
+            bool(DEFAULT_FLARESOLVERR["use_app_proxy"]),
         ),
     }
 
@@ -433,6 +465,7 @@ class ConfigStore:
         data["backup"] = self.get_backup_settings()
         data["image_storage"] = self.get_image_storage_settings()
         data["chat_completion_cache"] = self.get_chat_completion_cache_settings()
+        data["flaresolverr"] = self.get_flaresolverr_settings()
         data.pop("auth-key", None)
         return data
 
@@ -451,6 +484,10 @@ class ConfigStore:
             next_data["chat_completion_cache"] = _normalize_chat_completion_cache_settings(
                 next_data.get("chat_completion_cache")
             )
+        if "flaresolverr" in next_data:
+            next_data["flaresolverr"] = _normalize_flaresolverr_settings(
+                next_data.get("flaresolverr")
+            )
         next_data.pop("backup_state", None)
         self.data = next_data
         self._save()
@@ -464,6 +501,9 @@ class ConfigStore:
 
     def get_chat_completion_cache_settings(self) -> dict[str, object]:
         return _normalize_chat_completion_cache_settings(self.data.get("chat_completion_cache"))
+
+    def get_flaresolverr_settings(self) -> dict[str, object]:
+        return _normalize_flaresolverr_settings(self.data.get("flaresolverr"))
 
     def get_storage_backend(self) -> StorageBackend:
         """获取存储后端实例（单例）"""
